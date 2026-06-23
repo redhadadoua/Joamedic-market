@@ -1,0 +1,102 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 1. Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // 2. Global Helpers
+    function isSignedIn() {
+      return request.auth != null;
+    }
+    // Admin check: assumes a special 'admins' document or check users collection role
+    function isAdmin() {
+      // For this app, checking if a specific admin doc exists or checking custom admin email
+      return isSignedIn() && exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+             get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'ADMIN';
+    }
+    function incoming() {
+      return request.resource.data;
+    }
+    function existing() {
+      return resource.data;
+    }
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    // 3. Validation Helpers
+    function isValidUser(data) {
+      return data.keys().hasAll(['name', 'email', 'role', 'createdAt']) &&
+             data.name is string && data.name.size() > 0 && data.name.size() <= 100 &&
+             data.email is string && data.email.size() <= 150 &&
+             data.role in ['USER', 'ADMIN'] &&
+             data.createdAt is number;
+    }
+
+    function isValidOrderItem(item) {
+      return item.keys().hasAll(['productId', 'name', 'color', 'size', 'quantity', 'price']) &&
+             item.productId is string && item.productId.size() <= 50 &&
+             item.name is string && item.name.size() <= 100 &&
+             item.color is string && item.color.size() <= 50 &&
+             item.size is string && item.size.size() <= 10 &&
+             item.quantity is number && item.quantity > 0 && item.quantity <= 100 &&
+             item.price is number && item.price >= 0;
+    }
+
+    function isValidOrder(data) {
+      return data.keys().hasAll(['customerInfo', 'items', 'total', 'status', 'createdAt', 'userId']) &&
+             data.customerInfo is map &&
+             data.customerInfo.keys().hasAll(['fullName', 'phone', 'country', 'city', 'address']) &&
+             data.customerInfo.fullName is string && data.customerInfo.fullName.size() <= 100 &&
+             data.customerInfo.phone is string && data.customerInfo.phone.size() <= 50 &&
+             data.customerInfo.country is string && data.customerInfo.country.size() <= 50 &&
+             data.customerInfo.city is string && data.customerInfo.city.size() <= 50 &&
+             data.customerInfo.address is string && data.customerInfo.address.size() <= 200 &&
+             data.items is list && data.items.size() > 0 && data.items.size() <= 20 &&
+             isValidOrderItem(data.items[0]) &&
+             data.total is number && data.total >= 0 &&
+             data.status in ['Pending', 'Confirmed', 'Processing', 'Shipped', 'Delivered', 'Cancelled'] &&
+             data.createdAt is number &&
+             data.userId is string && data.userId.size() <= 128;
+    }
+
+    // 4. Collection Rules
+    match /users/{userId} {
+      // Anyone can create their profile.
+      allow create: if isSignedIn() && request.auth.uid == userId && isValidId(userId) &&
+                       isValidUser(incoming()) && incoming().role == 'USER' && incoming().email == request.auth.token.email;
+      
+      allow read: if isSignedIn() && (request.auth.uid == userId || isAdmin());
+      
+      allow update: if isSignedIn() && isValidId(userId) && (
+        isAdmin() ||
+        (
+          request.auth.uid == userId && 
+          isValidUser(incoming()) &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['name']) // Users can only update their name
+        )
+      );
+    }
+
+    match /orders/{orderId} {
+      // Customers can create orders (anonymous or logged in). If logged in, userId must match. If anon, userId can be 'anonymous'.
+      allow create: if isValidId(orderId) && isValidOrder(incoming()) && 
+                       (incoming().status == 'Pending') &&
+                       (
+                         (isSignedIn() && incoming().userId == request.auth.uid) || 
+                         (!isSignedIn() && incoming().userId == 'anonymous')
+                       );
+      
+      // Customers can read their own orders; admins can read all
+      allow read: if (isSignedIn() && existing().userId == request.auth.uid) || isAdmin();
+      
+      // Only admins can update orders
+      allow update: if isAdmin() && isValidId(orderId) && isValidOrder(incoming());
+      
+      // Only admins can delete orders (or maybe no one should, but let's allow admins)
+      allow delete: if isAdmin() && isValidId(orderId);
+    }
+  }
+}
